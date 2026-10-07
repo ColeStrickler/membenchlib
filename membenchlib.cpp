@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fcntl.h>
+#include <stdexcept>
 #include <system_error>
 #include <sys/mman.h>
 #include <thread>
@@ -68,6 +69,7 @@ membench::MembenchLib::~MembenchLib()
 
 void membench::MembenchLib::SetupStridedAccess(uint32_t req_count, bool write, uint32_t stride, uint8_t mlp)
 {
+    write8(ctrl, MEMBENCH_CTRL_ACTIVE, false);
     write8(ctrl, MEMBENCH_CTRL_ACCESSPATTERN, ACCESS_PATTERN::STRIDED);
     write32(ctrl, MEMBENCH_CTRL_STRIDE, stride);
     write8(ctrl, MEMBENCH_CTRL_DOWRITE, write);
@@ -77,18 +79,20 @@ void membench::MembenchLib::SetupStridedAccess(uint32_t req_count, bool write, u
 
 void membench::MembenchLib::SetupLinearAccess(uint32_t req_count, uint8_t mlp, bool write)
 {
+    write8(ctrl, MEMBENCH_CTRL_ACTIVE, false);
     write8(ctrl, MEMBENCH_CTRL_ACCESSPATTERN, ACCESS_PATTERN::LINEAR);
     write8(ctrl, MEMBENCH_CTRL_SETMLP, mlp);
-    write32(ctrl, MEMBENCH_CTRL_REQCOUNT, req_count);
     write8(ctrl, MEMBENCH_CTRL_DOWRITE, write);
+    write32(ctrl, MEMBENCH_CTRL_REQCOUNT, req_count);
 }
 
 void membench::MembenchLib::SetupRandomAccess(uint32_t req_count, uint8_t mlp, bool write)
 {
+    write8(ctrl, MEMBENCH_CTRL_ACTIVE, false);
     write8(ctrl, MEMBENCH_CTRL_ACCESSPATTERN, ACCESS_PATTERN::RANDOM);
     write8(ctrl, MEMBENCH_CTRL_SETMLP, mlp);
-    write32(ctrl, MEMBENCH_CTRL_REQCOUNT, req_count);
     write8(ctrl, MEMBENCH_CTRL_DOWRITE, write);
+    write32(ctrl, MEMBENCH_CTRL_REQCOUNT, req_count);
 }
 
 
@@ -99,23 +103,34 @@ void membench::MembenchLib::SetupRandomAccess(uint32_t req_count, uint8_t mlp, b
 
     Bank designates the bank to access
 */
-void membench::MembenchLib::SetupBankAccess(uint32_t req_count, uint32_t bank_mask, uint8_t bank_set_mask, uint8_t row_bit_start, uint8_t mlp, bool write)
+void membench::MembenchLib::SetupBankAccess(uint32_t req_count, uint32_t bank_mask, uint32_t bank_set_mask, uint8_t row_bit_start, uint8_t mlp, bool write)
 {
-    uint32_t row_mask = 0;
-    for (int i = row_bit_start; i < 32; i++)
-        row_mask |= (1u << i);
-    uint32_t unset_bits = bank_mask | row_mask;
+    constexpr uint8_t kAddressBits = 28;
+    constexpr uint32_t kLineOffsetMask = 63;
+    constexpr uint32_t kAddressMask = (1u << kAddressBits) - 1;
 
+    if (row_bit_start >= kAddressBits)
+        throw std::invalid_argument("row_bit_start must be less than 28");
+    if ((bank_mask & ~kAddressMask) != 0)
+        throw std::invalid_argument("bank_mask contains bits outside the reserved address region");
+    if ((bank_mask & kLineOffsetMask) != 0)
+        throw std::invalid_argument("bank_mask cannot include bits within a 64-byte cache line");
+    if ((bank_set_mask & ~bank_mask) != 0)
+        throw std::invalid_argument("bank_set_mask must be a subset of bank_mask");
+
+    const uint32_t row_mask = kAddressMask & ~((1u << row_bit_start) - 1);
+    if ((bank_mask & row_mask) != 0)
+        throw std::invalid_argument("bank_mask must be below row_bit_start");
+    const uint32_t unset_bits = bank_mask | row_mask;
+
+    write8(ctrl, MEMBENCH_CTRL_ACTIVE, false);
     write8(ctrl, MEMBENCH_CTRL_ACCESSPATTERN, ACCESS_PATTERN::BANK);
     write8(ctrl, MEMBENCH_CTRL_SETMLP, mlp);
-    write32(ctrl, MEMBENCH_CTRL_REQCOUNT, req_count);
     write8(ctrl, MEMBENCH_CTRL_DOWRITE, write);
-
-
     write32(ctrl, MEMBENCH_CTRL_MASKSET, bank_set_mask);
     write32(ctrl, MEMBENCH_CTRL_MASKUNSET, unset_bits);
     write8(ctrl, MEMBENCH_CTRL_ROWBITSTART, row_bit_start);
-
+    write32(ctrl, MEMBENCH_CTRL_REQCOUNT, req_count);
 }
 
 void membench::MembenchLib::Start()
@@ -128,13 +143,16 @@ void membench::MembenchLib::Reset()
     write8(ctrl, MEMBENCH_CTRL_RST, true);
 }
 
-uint32_t membench::MembenchLib::WaitUntilDone(bool print_progress, uint32_t timeout_seconds)
+uint32_t membench::MembenchLib::WaitUntilDone(bool print_progress, uint32_t timeout_seconds, uint32_t reqCount)
 {
     const auto started = std::chrono::steady_clock::now();
     uint32_t last_reported = 0;
     uint32_t tmp = 0;
     bool reported = false;
-    while ((tmp = READ_UINT32(reinterpret_cast<uint64_t>(ctrl) + MEMBENCH_CTRL_REQCOUNT)) != 0) {
+
+
+    while (READ_BOOL(reinterpret_cast<uint64_t>(ctrl) + MEMBENCH_CTRL_ACTIVE)) {
+        tmp = READ_UINT32(reinterpret_cast<uint64_t>(ctrl) + MEMBENCH_CTRL_REQCOUNT);
         if (print_progress && (!reported || (tmp < last_reported && last_reported - tmp >= 100000)))
         {
             printf("Requests remaining %u\n", tmp);
@@ -144,8 +162,15 @@ uint32_t membench::MembenchLib::WaitUntilDone(bool print_progress, uint32_t time
         }
         if (timeout_seconds != 0 &&
             std::chrono::steady_clock::now() - started >= std::chrono::seconds(timeout_seconds))
-            return tmp;
+            return tmp == 0 ? UINT32_MAX : tmp;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+
+    const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - started;
+    const double bandwidth_mbps = (static_cast<double>(reqCount) * 64.0) /
+                                  elapsed.count() / 1.0e6;
+    printf("Bandwidth: %.3f MB/s\n", bandwidth_mbps);
+    fflush(stdout);
+
     return 0;
 }

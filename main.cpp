@@ -35,8 +35,8 @@ void print_usage(const char* program, std::ostream& out)
         << "      --read                  Read requests\n"
         << "      --stride N              Stride for strided access\n"
         << "      --bank-mask N           Bank bit mask for bank access\n"
-        << "      --bank-set-mask N       Bank selection bits for bank access (0..255)\n"
-        << "      --row-bit-start N       First row bit for bank access (0..31)\n"
+        << "      --bank-set-mask N       Bank selection bits for bank access\n"
+        << "      --row-bit-start N       First row bit for bank access (0..27)\n"
         << "      --reset                 Reset before configuring the run\n"
         << "      --reset-only            Reset without starting a run\n"
         << "      --no-wait               Return immediately after starting\n"
@@ -122,10 +122,10 @@ int main(int argc, char* argv[])
         case kStride: number = &stride; name = "stride"; stride_given = true; break;
         case kBankMask: number = &bank_mask; name = "bank-mask"; bank_mask_given = true; break;
         case kBankSetMask:
-            number = &bank_set_mask; maximum = UINT8_MAX;
+            number = &bank_set_mask;
             name = "bank-set-mask"; bank_set_mask_given = true; break;
         case kRowBitStart:
-            number = &row_bit_start; maximum = 31;
+            number = &row_bit_start; maximum = 27;
             name = "row-bit-start"; row_bit_start_given = true; break;
         case kReset: reset = true; break;
         case kResetOnly: reset_only = true; break;
@@ -183,6 +183,11 @@ int main(int argc, char* argv[])
         std::cerr << "--bank-mask, --bank-set-mask, and --row-bit-start are required only for bank access; bank mask must be nonzero\n";
         return 2;
     }
+    if (pattern == "bank" && ((bank_set_mask & ~bank_mask) != 0 || (bank_mask & 0x3f) != 0 ||
+                              (bank_mask >> row_bit_start) != 0)) {
+        std::cerr << "bank selection bits must be within bank-mask; bank bits must be between cache-line and row bits\n";
+        return 2;
+    }
     if ((progress || timeout_given) && !wait) {
         std::cerr << "--progress and --timeout-seconds require waiting for completion\n";
         return 2;
@@ -200,15 +205,18 @@ int main(int argc, char* argv[])
             bench.SetupRandomAccess(static_cast<uint32_t>(requests), static_cast<uint8_t>(mlp), write);
         } else {
             bench.SetupBankAccess(static_cast<uint32_t>(requests), static_cast<uint32_t>(bank_mask),
-                                  static_cast<uint8_t>(bank_set_mask), static_cast<uint8_t>(row_bit_start),
+                                  static_cast<uint32_t>(bank_set_mask), static_cast<uint8_t>(row_bit_start),
                                   static_cast<uint8_t>(mlp), write);
         }
         bench.Start();
         std::cerr << "Benchmark started" << (wait ? "; waiting for completion\n" : "\n");
         if (wait) {
-            const uint32_t remaining = bench.WaitUntilDone(progress, static_cast<uint32_t>(timeout_seconds));
+            const uint32_t remaining = bench.WaitUntilDone(progress, static_cast<uint32_t>(timeout_seconds), requests);
             if (remaining != 0) {
-                std::cerr << "Timed out with " << remaining << " requests remaining\n";
+                if (remaining == UINT32_MAX)
+                    std::cerr << "Timed out waiting for outstanding responses\n";
+                else
+                    std::cerr << "Timed out with " << remaining << " requests remaining\n";
                 return 1;
             }
             std::cerr << "Benchmark complete\n";

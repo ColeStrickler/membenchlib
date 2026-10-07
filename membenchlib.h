@@ -55,10 +55,10 @@ public:
     void SetupStridedAccess(uint32_t req_count, bool write, uint32_t stride, uint8_t mlp);
     void SetupLinearAccess(uint32_t req_count, uint8_t mlp, bool write);
     void SetupRandomAccess(uint32_t req_count, uint8_t mlp, bool write);
-    void SetupBankAccess(uint32_t req_count, uint32_t bank_mask,  uint8_t bank_set_mask, uint8_t row_bit_start, uint8_t mlp, bool write);
+    void SetupBankAccess(uint32_t req_count, uint32_t bank_mask, uint32_t bank_set_mask, uint8_t row_bit_start, uint8_t mlp, bool write);
     void Start();
     void Reset();
-    uint32_t WaitUntilDone(bool print_progress = false, uint32_t timeout_seconds = 0);
+    uint32_t WaitUntilDone(bool print_progress, uint32_t timeout_seconds, uint32_t reqCount);
 private:
     int fd_DevMem;
     void* ctrl;
